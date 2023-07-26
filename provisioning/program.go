@@ -180,11 +180,6 @@ func (me *Provisioning) Provision(name string, script string) (string, error) {
 		},
 	})
 
-	// 	$ pulumi config set azure:clientId <clientID>
-	// $ pulumi config set azure:clientSecret <clientSecret> --secret
-	// $ pulumi config set azure:tenantId <tenantID>
-	// $ pulumi config set azure:subscriptionId <subscriptionId>
-
 	fmt.Println("Installing the AWS plugin")
 
 	// for inline source programs, we must manage plugins ourselves
