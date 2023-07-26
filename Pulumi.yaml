@@ -1,0 +1,3 @@
+name: pulumi-faas
+runtime: go
+description: A go project to deploy functions to k8

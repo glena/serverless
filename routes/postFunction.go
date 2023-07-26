@@ -1,9 +1,11 @@
 package routes
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/glena/pulumi-faas/provisioning"
 )
 
 type PostFunctionBody struct {
@@ -11,7 +13,11 @@ type PostFunctionBody struct {
 	Script string `json:"script" binding:"required"`
 }
 
-func PostFunction(c *gin.Context) {
+type PostFunctionResponse struct {
+	Url string `json:"url"`
+}
+
+func PostFunction(c *gin.Context, program provisioning.Provisioning) {
 	requestBody := PostFunctionBody{}
 
 	if err := c.ShouldBindJSON(&requestBody); err != nil {
@@ -20,7 +26,16 @@ func PostFunction(c *gin.Context) {
 		return
 	}
 
+	fmt.Printf("Deploying stack %q %q\n", requestBody.Name, requestBody.Script)
 
+	url, err := program.Provision(requestBody.Name, requestBody.Script)
 
-	c.JSON(http.StatusAccepted, &requestBody)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, err)
+		return
+	}
+
+	c.JSON(http.StatusAccepted, &PostFunctionResponse{
+		Url: url,
+	})
 }

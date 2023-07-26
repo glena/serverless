@@ -2,34 +2,86 @@ package provisioning
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
-	"github.com/pulumi/pulumi-awsx/sdk/go/awsx/ecr"
+	"github.com/google/uuid"
 	appsv1 "github.com/pulumi/pulumi-kubernetes/sdk/v3/go/kubernetes/apps/v1"
 	corev1 "github.com/pulumi/pulumi-kubernetes/sdk/v3/go/kubernetes/core/v1"
 	metav1 "github.com/pulumi/pulumi-kubernetes/sdk/v3/go/kubernetes/meta/v1"
+
+	"github.com/pulumi/pulumi-aws/sdk/v5/go/aws/ecr"
+	"github.com/pulumi/pulumi-docker/sdk/v4/go/docker"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto"
-	"github.com/pulumi/pulumi/sdk/v3/go/auto/optdestroy"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optup"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
 
-func deploy(ctx *pulumi.Context) error {
-	isMinikube := false//config.GetBool(ctx, "isMinikube")
-	customImageName := "node-app"
+type AWSConfiguration struct {
+	Region    string
+	AccessKey string
+	SecretKey string
+}
 
-	image, err := ecr.NewImage(ctx, customImageName, &ecr.ImageArgs{
-		// RepositoryUrl: repo.url,
-		Dockerfile:    pulumi.String("./" + customImageName),
-	})
+type Provisioning struct {
+	Configuration AWSConfiguration
+}
 
-	appLabels := pulumi.StringMap{
-		"app": pulumi.String(customImageName),
+func (me *Provisioning) deploy(ctx *pulumi.Context, name string, script string) error {
+	imageName := name
+	serviceName := name + "-" + uuid.New().String()
+	deploymentName := serviceName
+
+	repo, err := ecr.NewRepository(ctx, imageName, nil)
+	if err != nil {
+		return err
 	}
 
-	deployment, err := appsv1.NewDeployment(ctx, customImageName, &appsv1.DeploymentArgs{
+	registryInfo := repo.RegistryId.ApplyT(func(id string) (docker.Registry, error) {
+		creds, err := ecr.GetCredentials(ctx, &ecr.GetCredentialsArgs{RegistryId: id})
+		if err != nil {
+			return docker.Registry{}, err
+		}
+		decoded, err := base64.StdEncoding.DecodeString(creds.AuthorizationToken)
+		if err != nil {
+			return docker.Registry{}, err
+		}
+		parts := strings.Split(string(decoded), ":")
+		if len(parts) != 2 {
+			return docker.Registry{}, errors.New("invalid credentials")
+		}
+		return docker.Registry{
+			Server:   &creds.ProxyEndpoint,
+			Username: &parts[0],
+			Password: &parts[1],
+		}, nil
+	}).(docker.RegistryOutput)
+
+	image, err := docker.NewImage(ctx, imageName, &docker.ImageArgs{
+
+		Build: &docker.DockerBuildArgs{
+			Dockerfile: pulumi.String("./provisioning/Dockerfile"),
+			Platform:   pulumi.String("linux/amd64"),
+			Args: pulumi.StringMap{
+				"script": pulumi.String(script),
+			},
+		},
+		ImageName: repo.RepositoryUrl,
+		Registry:  registryInfo,
+	})
+
+	if err != nil {
+		return err
+	}
+
+	appLabels := pulumi.StringMap{
+		"app": pulumi.String(deploymentName),
+	}
+
+	deployment, err := appsv1.NewDeployment(ctx, deploymentName, &appsv1.DeploymentArgs{
 		Spec: appsv1.DeploymentSpecArgs{
 			Selector: &metav1.LabelSelectorArgs{
 				MatchLabels: appLabels,
@@ -42,8 +94,8 @@ func deploy(ctx *pulumi.Context) error {
 				Spec: &corev1.PodSpecArgs{
 					Containers: corev1.ContainerArray{
 						corev1.ContainerArgs{
-							Name:  pulumi.String(customImageName),
-							Image: image.ImageUri,
+							Name:  pulumi.String(deploymentName),
+							Image: image.ImageName,
 							Ports: corev1.ContainerPortArray{
 								&corev1.ContainerPortArgs{
 									ContainerPort: pulumi.Int(80),
@@ -59,9 +111,6 @@ func deploy(ctx *pulumi.Context) error {
 	}
 
 	feType := "LoadBalancer"
-	if isMinikube {
-		feType = "ClusterIP"
-	}
 
 	template := deployment.Spec.ApplyT(func(v *appsv1.DeploymentSpec) *corev1.PodTemplateSpec {
 		return &v.Template
@@ -72,7 +121,7 @@ func deploy(ctx *pulumi.Context) error {
 	service := &corev1.ServiceArgs{
 		Metadata: meta,
 		Spec: &corev1.ServiceSpecArgs{
-			Type: pulumi.String(feType),
+			Type:     pulumi.String(feType),
 			Selector: appLabels,
 			Ports: &corev1.ServicePortArray{
 				&corev1.ServicePortArgs{
@@ -84,45 +133,57 @@ func deploy(ctx *pulumi.Context) error {
 		},
 	}
 
-	frontend, err := corev1.NewService(ctx, customImageName, service)
+	frontend, err := corev1.NewService(ctx, serviceName, service)
 
-	var ip pulumi.StringOutput
-
-	if isMinikube {
-		ip = frontend.Spec.ApplyT(func(val *corev1.ServiceSpec) string {
-			if val.ClusterIP != nil {
-				return *val.ClusterIP
-			}
-			return ""
-		}).(pulumi.StringOutput)
-	} else {
-		ip = frontend.Status.ApplyT(func(val *corev1.ServiceStatus) string {
-			if val.LoadBalancer.Ingress[0].Ip != nil {
-				return *val.LoadBalancer.Ingress[0].Ip
-			}
-			return *val.LoadBalancer.Ingress[0].Hostname
-		}).(pulumi.StringOutput)
+	if err != nil {
+		return err
 	}
 
-	ctx.Export("ip", ip)
+	url := frontend.Status.ApplyT(func(val *corev1.ServiceStatus) string {
+		return *val.LoadBalancer.Ingress[0].Hostname
+	}).(pulumi.StringOutput)
+
+	ctx.Export("url", url)
 	return nil
 }
 
-func Provision(destroy bool) error {
+func (me *Provisioning) Provision(name string, script string) (string, error) {
 	ctx := context.Background()
-
-	projectName := "faas"
-	// we use a simple stack name here, but recommend using auto.FullyQualifiedStackName for maximum specificity.
-	stackName := "dev"
-	// stackName := auto.FullyQualifiedStackName("myOrgOrUser", projectName, stackName)
 
 	// create or select a stack matching the specified name and project.
 	// this will set up a workspace with everything necessary to run our inline program (deployFunc)
-	s, err := auto.UpsertStackInlineSource(ctx, stackName, projectName, deploy)
+	s, err := auto.UpsertStackInlineSource(ctx, name, "onboarding-faas", func(ctx *pulumi.Context) error {
+		return me.deploy(ctx, name, script)
+	})
 
-	fmt.Printf("Created/Selected stack %q\n", stackName)
+	if err != nil {
+		fmt.Printf("Failed to upsert stack: %v\n", err)
+		return "", err
+	}
+
+	fmt.Printf("Created/Selected stack %q\n", name)
 
 	w := s.Workspace()
+
+	w.SetAllConfig(ctx, name, auto.ConfigMap{
+		"aws:region": auto.ConfigValue{
+			Value:  me.Configuration.Region,
+			Secret: false,
+		},
+		"aws:accessKey": auto.ConfigValue{
+			Value:  me.Configuration.AccessKey,
+			Secret: false,
+		},
+		"aws:secretKey": auto.ConfigValue{
+			Value:  me.Configuration.SecretKey,
+			Secret: true,
+		},
+	})
+
+	// 	$ pulumi config set azure:clientId <clientID>
+	// $ pulumi config set azure:clientSecret <clientSecret> --secret
+	// $ pulumi config set azure:tenantId <tenantID>
+	// $ pulumi config set azure:subscriptionId <subscriptionId>
 
 	fmt.Println("Installing the AWS plugin")
 
@@ -130,7 +191,7 @@ func Provision(destroy bool) error {
 	err = w.InstallPlugin(ctx, "aws", "v4.0.0")
 	if err != nil {
 		fmt.Printf("Failed to install program plugins: %v\n", err)
-		return err
+		return "", err
 	}
 
 	fmt.Println("Successfully installed AWS plugin")
@@ -144,25 +205,10 @@ func Provision(destroy bool) error {
 	_, err = s.Refresh(ctx)
 	if err != nil {
 		fmt.Printf("Failed to refresh stack: %v\n", err)
-		return err
+		return "", err
 	}
 
 	fmt.Println("Refresh succeeded!")
-
-	if destroy {
-		fmt.Println("Starting stack destroy")
-
-		// wire up our destroy to stream progress to stdout
-		stdoutStreamer := optdestroy.ProgressStreams(os.Stdout)
-
-		// destroy our stack and exit early
-		_, err := s.Destroy(ctx, stdoutStreamer)
-		if err != nil {
-			fmt.Printf("Failed to destroy stack: %v", err)
-		}
-		fmt.Println("Stack successfully destroyed")
-		return err
-	}
 
 	fmt.Println("Starting update")
 
@@ -173,19 +219,19 @@ func Provision(destroy bool) error {
 	res, err := s.Up(ctx, stdoutStreamer)
 	if err != nil {
 		fmt.Printf("Failed to update stack: %v\n\n", err)
-		return err
+		return "", err
 	}
 
-	fmt.Println("Update succeeded!")
-
 	// get the URL from the stack outputs
-	url, ok := res.Outputs["websiteUrl"].Value.(string)
+	url, ok := res.Outputs["url"].Value.(string)
 	if !ok {
 		fmt.Println("Failed to unmarshall output URL")
-		return errors.New("Failed to unmarshall output URL")
+		return "", errors.New("failed to unmarshall output URL")
 	}
 
 	fmt.Printf("URL: %s\n", url)
 
-	return nil
+	fmt.Println("Update succeeded!")
+
+	return url, nil
 }
